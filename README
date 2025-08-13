@@ -1,0 +1,307 @@
+# Message Broker System
+
+> Lightweight, developer-friendly message broker with Queue (Point‑to‑Point) & Topic (Publish‑Subscribe) patterns, built for Python services and easy no‑code integrations (n8n, webhooks).
+
+---
+
+## ✨ Highlights / Features
+
+* **Queue (Point‑to‑Point)**: one message → exactly one consumer (supports **competing consumers**)
+* **Topic (Publish‑Subscribe)**: one message → multiple subscribers
+* **Routing Keys & Wildcards**: `order.*`, `*.created`, `payment.#` (multi-level)
+* **Acknowledgements**: manual/auto **ACK**, **NACK**, **requeue**
+* **Observability**: `/health`, `/metrics`, basic queue stats
+* **Auth**: API Key / Bearer Token; CORS configurable
+
+> **Note**: This README is template‑ready. Update the **ENV**, **docker-compose**, and **Tech Stack** sections to match your setup exactly.
+
+---
+
+## 🏗️ Architecture (High‑Level)
+
+```
+           +-------------+          Publish (HTTP/SDK)
+Producer →  |  API Layer |  ──────────────────────────────▶
+           +-------------+                                 
+                    │                                       
+                    ▼                                       
+           +-----------------+        Persist/Dispatch      
+           |  Broker Core    | ─────────────────────────▶ Queues / Topics
+           |  (Router, DLQ)  |
+           +-----------------+                              
+             │        │                                     
+             │        └──► Storage: In‑Memory / Redis / PostgreSQL
+             │                                               
+             ▼                                               
+       Pull/Stream (HTTP/SDK)                                
+   +-----------+     +-----------+                           
+   | Consumer  | ... | Consumer  |  ◀────────────────────────
+   +-----------+     +-----------+
+```
+
+---
+
+## 🧰 Tech Stack
+
+* **Language**: Python (3.10+)
+* **Server**: Flask / FastAPI (choose one; default here: Flask)
+* **Storage**: In‑Memory (dev) | Redis (prod) | PostgreSQL (optional persistence)
+* **Queue Mechanics**: visibility timeout, ack/nack, retry & DLQ
+* **Auth**: API Key / Bearer (JWT optional)
+
+---
+
+## ⚙️ Configuration
+
+Environment variables (example using `.env`):
+
+```env
+# Server
+APP_PORT=8080
+APP_HOST=0.0.0.0
+APP_ENV=production  # development | production
+
+# Auth
+AUTH_MODE=apikey    # none | apikey | bearer
+API_KEY=supersecretkey
+JWT_SECRET=change_me
+
+# Storage
+STORE_BACKEND=redis     # memory | redis | postgres
+REDIS_URL=redis://redis:6379/0
+
+# Delivery
+VISIBILITY_TIMEOUT_SEC=30
+MAX_RETRIES=5
+BACKOFF_STRATEGY=exponential  # fixed | linear | exponential
+BACKOFF_BASE_MS=500
+
+# DLQ
+DLQ_SUFFIX=.DLQ
+```
+
+---
+
+## 🐳 Docker & Quick Start
+
+### Option A — docker‑compose
+
+```yaml
+version: '3.9'
+services:
+  broker:
+    image: ghcr.io/your-org/message-broker:latest
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENV: production
+      AUTH_MODE: apikey
+      API_KEY: supersecretkey
+      STORE_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      VISIBILITY_TIMEOUT_SEC: 30
+      MAX_RETRIES: 5
+    depends_on:
+      - redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+```
+
+```bash
+# Start
+docker compose up -d
+# Health check
+curl -s http://localhost:8080/health | jq
+```
+
+### Option B — Local (Python)
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env  # edit values
+python app.py
+```
+
+---
+
+## 🔌 REST API Reference
+
+Base URL: `http://<host>:8080/api/v1`
+
+> **Auth**: Send header `Authorization: Bearer <API_KEY>` when `AUTH_MODE=apikey`.
+
+### Queues (Point‑to‑Point)
+
+#### Create Queue
+
+`PUT /queues/{name}`
+
+```bash
+curl -X PUT \
+  -H "Authorization: Bearer $API_KEY" \
+  http://localhost:8080/api/v1/queues/payments
+```
+
+#### Publish to Queue
+
+`POST /queues/{name}/publish`
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $API_KEY" \
+  -d '{"message": {"order_id": 42}, "idempotency_key": "abc-42"}' \
+  http://localhost:8080/api/v1/queues/payments/publish
+```
+
+#### Pull (Reserve) Message
+
+`POST /queues/{name}/pull`  — reserves a message for `VISIBILITY_TIMEOUT_SEC`
+
+```bash
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  http://localhost:8080/api/v1/queues/payments/pull
+# → {"delivery_tag":"dtag-123","message":{...},"retry":0}
+```
+
+#### ACK / NACK
+
+`POST /queues/{name}/ack` / `POST /queues/{name}/nack`
+
+```bash
+# ACK
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"delivery_tag": "dtag-123"}' \
+  http://localhost:8080/api/v1/queues/payments/ack
+
+# NACK (requeue=false ⇒ goes to DLQ after retries)
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"delivery_tag": "dtag-123", "requeue": false}' \
+  http://localhost:8080/api/v1/queues/payments/nack
+```
+
+#### Peek / Stats
+
+`GET /queues/{name}/peek` / `GET /queues/{name}/stats`
+
+---
+
+### Topics (Publish‑Subscribe)
+
+#### Create Topic
+
+`PUT /topics/{name}`
+
+#### Subscribe (with Routing Key Pattern)
+
+`POST /topics/{name}/subscriptions`
+
+```json
+{
+  "endpoint": "http://consumer:5000/hook",  
+  "routing_key": "order.*"                    
+}
+```
+
+> **Note**: For **pull** style, set `mode: "pull"` and use `/topics/{name}/pull` to receive.
+
+#### Publish to Topic
+
+`POST /topics/{name}/publish`
+
+```json
+{
+  "routing_key": "order.created",
+  "message": {"order_id": 42}
+}
+```
+
+---
+
+## 🧪 SDK & Code Examples
+
+### Python (Publisher / Consumer)
+
+```python
+import os, requests
+BASE = os.getenv("BASE", "http://localhost:8080/api/v1")
+HEAD = {"Authorization": f"Bearer {os.getenv('API_KEY', 'supersecretkey')}"}
+
+# Publish
+r = requests.post(f"{BASE}/queues/payments/publish", json={
+    "message": {"order_id": 42, "amount": 999},
+    "idempotency_key": "ord-42"
+}, headers=HEAD)
+print(r.json())
+
+# Pull
+r = requests.post(f"{BASE}/queues/payments/pull", headers=HEAD)
+msg = r.json()
+# ... process ...
+requests.post(f"{BASE}/queues/payments/ack", json={"delivery_tag": msg["delivery_tag"]}, headers=HEAD)
+```
+
+### cURL (n8n Webhook → Broker)
+
+```bash
+# n8n webhook receives payload, then use HTTP Request node to forward:
+curl -X POST \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"message": {"event": "webhook", "payload": {"id": 1}}}' \
+  http://localhost:8080/api/v1/topics/events/publish?routing_key=webhook.created
+```
+
+---
+
+## 🔒 Security
+
+* **Auth Modes**: `none` | `apikey` | `bearer (JWT)`
+* **CORS**: allowlist origins via `CORS_ORIGINS`
+* **Idempotency**: pass `idempotency_key` to de‑duplicate publishes
+* **Rate Limiting** (optional): enable via proxy (e.g., NGINX) or app config
+
+---
+
+## 📈 Observability & Ops
+
+* `GET /health` – liveness
+* `GET /metrics` – counters: published, delivered, acked, nacked, retries, DLQ size
+* `GET /stats` – per queue/topic sizes & in‑flight counts
+* **Structured Logs**: JSON logs with request ids and delivery tags
+
+---
+
+## 🧯 Failure Handling
+
+* **Visibility Timeout**: message is re‑deliverable if not ACKed in time
+* **Retries & Backoff**: `MAX_RETRIES`, `BACKOFF_STRATEGY`, `BACKOFF_BASE_MS`
+* **DLQ**: `<queue><DLQ_SUFFIX>` collects permanently failed messages
+
+---
+
+## 📝 Roadmap
+
+* [ ] Exactly‑once with persistent dedupe store
+* [ ] Stream subscriptions (Server‑Sent Events / WebSocket)
+* [ ] Priority queues
+* [ ] Scheduled / delayed messages
+* [ ] Message TTL & auto‑expire
+* [ ] OpenAPI (Swagger) docs UI
+
+---
+
+## 🤝 Contributing
+
+1. Fork → create feature branch → PR
+2. Write tests for broker core (routing, retry, DLQ)
+3. Add docs for any new env or endpoints
+
+---
+
+
